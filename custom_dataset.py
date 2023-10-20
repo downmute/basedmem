@@ -21,3 +21,5 @@ class MemesDataset(Dataset):
         
         if self.transform:
             image = self.transform(image)
+
+        return(image, y_label)
