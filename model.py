@@ -50,27 +50,46 @@ class MultiHeadSelfAttention(nn.Module):
         return out
         
                
-class ResNetBlock(nn.Module):
+class Block(nn.Module):
     def __init__(self, ch):
-        super(ResNetBlock, self).__init__()
+        super(Block, self).__init__()
         
-        self.conv = nn.Sequential(
-            nn.GroupNorm(num_groups=32, num_channels=ch),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=ch, out_channels=ch,kernel_size=3),
-            nn.GroupNorm(num_groups=32, num_channels=ch),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=ch, out_channels=ch,kernel_size=3),        
-        ) 
+        self.gn = nn.GroupNorm(num_groups=32, num_channels=ch),
+        self.act = nn.SiLU(),
+        self.conv = nn.Conv2d(in_channels=ch, out_channels=ch, kernel_size=3, padding=1)
         
-        self.identity_conv = nn.Conv2d(in_channels=ch, out_channels=ch, kernel_size=1)
+    def forward(self, x, scale_shift=None):
+        out = self.gn(x)
+        if scale_shift != None:
+            scale, shift = scale_shift
+            out = out * (scale+1) + shift
+            
+        out = self.act(out)
         
-    def forward(self, x):
-        identity = self.identity_conv(x)
-        out = (identity + self.conv(x)) * 2**-0.5
-        
-        return out
+        return self.conv(out)
     
+class ResNetBlock(nn.Module):
+    def __init__(self, ch, t_emb_size, use_ca=False):
+        super(DBlock, self).__init__()
+        
+        self.use_ca = use_ca
+        self.ln = nn.LayerNorm()
+        self.rn_block = Block(ch=ch)
+        self.final_block = Block(ch=ch)
+        if use_ca:
+            self.mhsa = MultiHeadSelfAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
+        self.t_proj = nn.Linear(t_emb_size, ch)
+        
+    def forward(self, t_emb, c_emb, x):
+        t_proj = nn.SiLU(self.t_proj(t_emb))
+        scale_shift = t_proj[:, :, None, None].chunk(2, dim=1)
+        out = self.rn_block(x)
+        out = out + self.ln(c_emb)
+        if self.use_ca:
+            out = out + self.ln(self.mhsa(out, c_emb))
+        out = self.final_block(out, scale_shift)
+            
+        return out
 
 class DBlock(nn.Module):
     def __init__(self, ch, t_emb_size, n_blocks, downsample=True, use_ca=False):
@@ -78,7 +97,8 @@ class DBlock(nn.Module):
         
         self.conv = nn.Conv2d(in_channels=ch, out_channels=ch, kernel_size=3, stride=2)
         self.ln = nn.LayerNorm()
-        self.rn_blocks = nn.ModuleList([ResNetBlock(ch=ch) for _ in range(n_blocks)])
+        self.rn_blocks = nn.ModuleList([Block(ch=ch) for _ in range(n_blocks)])
+        self.final_block = Block(ch=ch)
         self.use_ca = use_ca
         self.mhsa = MultiHeadSelfAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
         self.t_proj = nn.Linear(t_emb_size, ch)
@@ -86,13 +106,15 @@ class DBlock(nn.Module):
         
     def forward(self, t_emb, c_emb, x):
         t_proj = nn.SiLU(self.t_proj(t_emb))
+        scale_shift = t_proj[:, :, None, None].chunk(2, dim=1)
         if self.downsample:
             out = self.conv(x)
-        out = out + t_proj + self.ln(c_emb)
         for block in self.rn_blocks():
             out = block(out)
+        out = out + self.ln(c_emb)
         if self.use_ca:
-            out = self.ln(self.mhsa(out, c_emb))
+            out = out + self.ln(self.mhsa(out, c_emb))
+        out = self.final_block(out, scale_shift)
             
         return out
     
@@ -103,7 +125,8 @@ class UBlock(nn.Module):
         
         self.conv = nn.Conv2d(in_channels=ch, out_channels=ch, kernel_size=3, stride=1),
         self.ln = nn.LayerNorm()
-        self.rn_blocks = nn.ModuleList([ResNetBlock(ch=ch) for _ in range(n_blocks)])
+        self.rn_blocks = nn.ModuleList([Block(ch=ch) for _ in range(n_blocks)])
+        self.final_block = Block(ch=ch)
         self.use_ca = use_ca
         self.mhsa = MultiHeadSelfAttention(heads=8, hidden_size=64, emb_size=ch, c_emb=self.c_emb)
         self.t_proj = nn.Linear(t_emb_size, ch)
@@ -111,15 +134,18 @@ class UBlock(nn.Module):
         
     def forward(self, t_emb, c_emb, x):
         t_proj = nn.SiLU(self.t_proj(t_emb))
-        out = x + t_proj + self.ln(c_emb)
+        scale_shift = t_proj[:, :, None, None].chunk(2, dim=1)
         for block in self.rn_blocks:
-            out = block(out)
+            x = block(x)
+        out = x + self.ln(c_emb)
         if self.use_ca:
-            out = self.ln(self.mhsa(out, c_emb))
+            out = out + self.ln(self.mhsa(out, c_emb))
         if self.upsample:
             out = self.conv(out)
+        out = self.final_block(out, scale_shift)
             
         return out
+        
         
 class InceptionModule(nn.Module):
     def __init__(self, dim_in, dim_out, stride: int=2):
@@ -137,14 +163,32 @@ class InceptionModule(nn.Module):
     def forward(self, x):
         fmaps = tuple(map(lambda conv: conv(x), self.convs))
         return torch.cat(fmaps, dim=1)        
-        
+
+def Downsample(in_ch, out_ch):
+    return nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)
+
+def Upsample(in_ch, out_ch):
+    return nn.Sequential(
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.Conv2d(in_ch, out_ch, 3, padding=1)
+    )
 
 class UNet(nn.Module):
-    def __init__(self, diff_steps=400, t_emb_size=512):
+    def __init__(self, init_ch_list=[1, 2, 3, 4], channels=3, init_out_dim=64, diff_steps=400, t_emb_size=512, init_blocks=3):
         super(UNet, self).__init__()
         
         ## 64x64
-        self.init_conv = InceptionModule()
+        self.init_conv = InceptionModule(channels, dim=init_out_dim*init_ch_list[0], stride=1)
+        self.init_block1 = ResNetBlock(init_out_dim*init_ch_list[0], t_emb_size=t_emb_size, use_ca=True)
+        self.init_block_group1 = nn.ModuleList(ResNetBlock(init_out_dim*init_ch_list[0], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.downsample1 = Downsample(init_out_dim*init_ch_list[0], init_out_dim*init_ch_list[1])
+        self.init_block_group2 = nn.ModuleList(ResNetBlock(init_out_dim*init_ch_list[1], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.downsample2 = Downsample(init_out_dim*init_ch_list[1], init_out_dim*init_ch_list[2])
+        self.init_block_group3 = nn.ModuleList(ResNetBlock(init_out_dim*init_ch_list[2], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.downsample3 = Downsample(init_out_dim*init_ch_list[2], init_out_dim*init_ch_list[3])
+        self.init_block2 = ResNetBlock(init_out_dim*init_ch_list[3], t_emb_size=t_emb_size, use_ca=True)
+        self.init_block3 = ResNetBlock(init_out_dim*init_ch_list[3], t_emb_size=t_emb_size, use_ca=True)
+        self.upsample1 = Upsample(init_out_dim*init_ch_list[3], init_out_dim*init_ch_list[2])
         
         ## upsample
         self.t_emb  = self.get_timestep_embedding(diff_steps, t_emb_size)
@@ -160,7 +204,26 @@ class UNet(nn.Module):
         
     def forward(self, c_emb, x_noisy, step):
         t_emb = self.t_emb(step)
-        db1 = self.db1(t_emb, c_emb, x_noisy)
+        conv1 = self.init_conv(x_noisy)
+        x = self.init_block1(t_emb, c_emb, conv1)
+        residuals = []
+        for block in self.init_block_group1:
+            x = block(t_emb, c_emb, x)
+            residuals.append(x)
+        x = self.downsample1(x)
+        for block in self.init_block_group2:
+            x = block(t_emb, c_emb, x)
+            residuals.append(x)
+        x = self.downsample2(x)
+        for block in self.init_block_group3:
+            x = block(t_emb, c_emb, x)
+            residuals.append(x)
+        x = self.downsample3(x)
+        x = self.init_block2(x)
+        x = self.init_block3(x)
+        
+        
+        db1 = self.db1(t_emb, c_emb, x)
         db2 = self.db2(t_emb, c_emb, db1)
         db3 = self.db3(t_emb, c_emb, db2)
         db4 = self.db4(t_emb, c_emb, db3)
@@ -301,6 +364,6 @@ class ImagenTrainer():
         return F.mse_loss(noise, noise_pred, reduction='sum')
     
     def sample():
-       
+       pass
     
 
