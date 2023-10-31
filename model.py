@@ -8,20 +8,37 @@ import matplotlib.pyplot as plt
 import math
 import numpy as np
 
-class SelfAttentionHead(nn.Module):
-    def __init__(self, hidden_size, input_size):
-        super(SelfAttentionHead, self).__init__()    
-        self.hidden_size = hidden_size
-        self.ln = nn.LayerNorm()
+class MultiHeadAttention(nn.Module):
+    def __init__(self, 
+                heads,
+                head_dim,
+                input_dim, 
+                context_dim: int=None):
+
+        super(Attention, self).__init__()   
+
+        self.heads = heads
+        
+        self.ln = nn.LayerNorm(input_dim)
+
         self.context_proj = nn.Sequential(
-            nn.LayerNorm(768),
-            nn.Linear(768, hidden_size * 2)
+            nn.LayerNorm(context_dim),
+            nn.Linear(context_dim, head_dim * 2)
         )
-        self.key = nn.Linear(input_size, hidden_size, bias=False) 
-        self.query = nn.Linear(input_size, hidden_size, bias=False) 
-        self.value = nn.Linear(input_size, hidden_size, bias=False) 
+
+        self.to_out = nn.Sequential(
+            nn.Linear(head_dim * heads, bias=False),
+            nn.LayerNorm(input_dim)
+        )
+
+        self.null_kv = nn.Parameter(torch.randn(2, head_dim))
+        self.to_q = nn.Linear(input_dim, head_dim * heads, bias=False) 
+        self.to_kv = nn.Linear(input_dim, head_dim * heads * 2, bias=False) 
         
     def forward(self, x, c_emb):
+
+        
+
         c_emb = self.context_proj(c_emb)
         k = torch.concat([self.key(x), self.ln(c_emb)], dim=-1)
         q = self.query(x)
@@ -38,7 +55,7 @@ class SelfAttentionHead(nn.Module):
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, heads, hidden_size, emb_size, input_size):
         self.heads = heads
-        self.sa_heads = nn.ModuleList([SelfAttentionHead(hidden_size=hidden_size, input_size=input_size) for _ in range(self.heads)])
+        self.sa_heads = nn.ModuleList([Attention(input_size=input_size, hidden_size=hidden_size) for _ in range(self.heads)])
         self.ln = nn.LayerNorm(emb_size)
         self.projection = nn.Linear(hidden_size * heads, emb_size)
         
@@ -77,7 +94,7 @@ class ResNetBlock(nn.Module):
         self.rn_block = Block(ch=ch)
         self.final_block = Block(ch=ch)
         if use_ca:
-            self.mhsa = MultiHeadSelfAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
+            self.mhsa = MultiHeadAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
         self.t_proj = nn.Linear(t_emb_size, ch)
         
     def forward(self, t_emb, c_emb, x):
