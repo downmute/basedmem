@@ -1,23 +1,28 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import einsum
 from sentence_transformers import SentenceTransformer
 from custom_dataset import MemeDataset
 from torchvision import transforms
 import matplotlib.pyplot as plt
 import math
 import numpy as np
+from einops import rearrange
+from einops_exts import rearrange_many, repeat_many
+from einops_exts.torch import EinopsToAndFrom
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, 
-                heads,
-                head_dim,
-                input_dim, 
+                input_dim: int, 
+                heads: int = 8,
+                head_dim: int = 64,
                 context_dim: int=None):
 
-        super(Attention, self).__init__()   
+        super(MultiHeadAttention, self).__init__()   
 
         self.heads = heads
+        self.head_dim = head_dim
         
         self.ln = nn.LayerNorm(input_dim)
 
@@ -35,38 +40,93 @@ class MultiHeadAttention(nn.Module):
         self.to_q = nn.Linear(input_dim, head_dim * heads, bias=False) 
         self.to_kv = nn.Linear(input_dim, head_dim * heads * 2, bias=False) 
         
-    def forward(self, x, c_emb):
+    def forward(self, x, c_emb=None):
+        b, n, _ = *x.shape[:2], x.device
+        
+        x = self.ln(x)
+        q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim=-1))
+        
+        ## transpose key, scale it by head_dim
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads) * self.head_dim**-0.5
+        
+        ## classifier free guidance
+        nk, nv = repeat_many(self.null_kv.unbind(dim=-2), 'd -> b 1 d', b=b)
+        k = torch.cat((nk, k), dim=-2)
+        v = torch.cat((nv, v), dim=-2)
 
+        ## caption embedding
+        if c_emb != None:
+            ck, cv = self.context_proj(c_emb).chunk(2, dim=-1)
+            k = torch.cat((ck, k), dim=-2)
+            v = torch.cat((cv, v), dim=-2)
         
-
-        c_emb = self.context_proj(c_emb)
-        k = torch.concat([self.key(x), self.ln(c_emb)], dim=-1)
-        q = self.query(x)
-        w = q @ k.T(2, 1) * self.hidden_size**-0.5
+        ## get query and key similarities
+        sim = einsum('b h i d, b j d -> b h i j', q, k)
         
-        w = F.softmax(w, dim=1)
+        attn = sim.softmax(dim=-1, dtype=torch.float32)
         
-        v = torch.concat([self.value(x), self.ln(c_emb)], dim=-1)
-        out = w @ v
+        ## matrix multiplication between attention and value tensors
+        out = einsum('b h i j, b j d -> b h i d', attn, v)
         
-        return out
+        out = rearrange(out, 'b h n d -> b n (h d)')
     
+        return self.to_out(out)
 
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, heads, hidden_size, emb_size, input_size):
+class CrossAttention(nn.Module):
+    def __init__(
+            self,
+            input_dim: int,
+            context_dim: int = None,
+            head_dim: int = 64,
+            heads: int = 8,
+            norm_context: bool = False
+    ):
+        super().__init__()
         self.heads = heads
-        self.sa_heads = nn.ModuleList([Attention(input_size=input_size, hidden_size=hidden_size) for _ in range(self.heads)])
-        self.ln = nn.LayerNorm(emb_size)
-        self.projection = nn.Linear(hidden_size * heads, emb_size)
-        
-        
-    def forward(self, x, c_emb):
-        out = torch.concat([h(self.ln(x), c_emb) for h in self.sa_heads], dim=-1)
-        out = self.ln(self.projection(out))
-              
-        return out
-        
-               
+        self.head_dim = head_dim
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.norm_context = nn.LayerNorm(context_dim) if norm_context else nn.Identity()
+
+        self.null_kv = nn.Parameter(torch.randn(2, head_dim))
+        self.to_q = nn.Linear(input_dim, head_dim * heads, bias=False)
+        self.to_kv = nn.Linear(context_dim, head_dim * heads * 2, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(head_dim * heads, input_dim, bias=False),
+            nn.LayerNorm(input_dim)
+        )
+
+    def forward(self, x: torch.tensor, context: torch.tensor) -> torch.tensor:
+        b, n, _ = *x.shape[:2], x.device
+
+        x = self.norm(x)
+        context = self.norm_context(context)
+
+        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim=-1))
+
+        ## transpose key
+        q, k, v = rearrange_many((q, k, v), 'b n (h d) -> b h n d', h=self.heads)
+
+        ## add null key and value for classifier free guidance
+        nk, nv = repeat_many(self.null_kv.unbind(dim=-2), 'd -> b h 1 d', h=self.heads, b=b)
+
+        k = torch.cat((nk, k), dim=-2)
+        v = torch.cat((nv, v), dim=-2)
+
+        q = q * self.head_dim ** -0.5
+
+        ## calculate similarity between queries and keys
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+
+        attn = sim.softmax(dim=-1, dtype=torch.float32)
+
+        ## calcualte matrix multiplication between attention and value tensors
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+    
+    
 class Block(nn.Module):
     def __init__(self, ch):
         super(Block, self).__init__()
@@ -85,6 +145,7 @@ class Block(nn.Module):
         
         return self.conv(out)
     
+    
 class ResNetBlock(nn.Module):
     def __init__(self, ch, t_emb_size, use_ca=False):
         super(DBlock, self).__init__()
@@ -94,14 +155,13 @@ class ResNetBlock(nn.Module):
         self.rn_block = Block(ch=ch)
         self.final_block = Block(ch=ch)
         if use_ca:
-            self.mhsa = MultiHeadAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
+            self.mhsa = CrossAttention(heads=8, head_dim=64, input_dim=ch, context_dim=768)
         self.t_proj = nn.Linear(t_emb_size, ch)
         
-    def forward(self, t_emb, c_emb, x):
+    def forward(self, t_emb, x, c_emb=None):
         t_proj = nn.SiLU(self.t_proj(t_emb))
         scale_shift = t_proj[:, :, None, None].chunk(2, dim=1)
         out = self.rn_block(x)
-        out = out + self.ln(c_emb)
         if self.use_ca:
             out = out + self.ln(self.mhsa(out, c_emb))
         out = self.final_block(out, scale_shift)
@@ -117,11 +177,11 @@ class DBlock(nn.Module):
         self.rn_blocks = nn.ModuleList([Block(ch=ch) for _ in range(n_blocks)])
         self.final_block = Block(ch=ch)
         self.use_ca = use_ca
-        self.mhsa = MultiHeadSelfAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
+        self.mhsa = MultiHeadAttention(heads=8, hidden_size=64, emb_size=ch, input_size=ch)
         self.t_proj = nn.Linear(t_emb_size, ch)
         self.downsample = downsample
         
-    def forward(self, t_emb, c_emb, x):
+    def forward(self, t_emb, x, c_emb):
         t_proj = nn.SiLU(self.t_proj(t_emb))
         scale_shift = t_proj[:, :, None, None].chunk(2, dim=1)
         if self.downsample:
@@ -145,11 +205,11 @@ class UBlock(nn.Module):
         self.rn_blocks = nn.ModuleList([Block(ch=ch) for _ in range(n_blocks)])
         self.final_block = Block(ch=ch)
         self.use_ca = use_ca
-        self.mhsa = MultiHeadSelfAttention(heads=8, hidden_size=64, emb_size=ch, c_emb=self.c_emb)
+        self.mhsa = MultiHeadAttention(heads=8, hidden_size=64, emb_size=ch, c_emb=self.c_emb)
         self.t_proj = nn.Linear(t_emb_size, ch)
         self.upsample = upsample
         
-    def forward(self, t_emb, c_emb, x):
+    def forward(self, t_emb, x, c_emb):
         t_proj = nn.SiLU(self.t_proj(t_emb))
         scale_shift = t_proj[:, :, None, None].chunk(2, dim=1)
         for block in self.rn_blocks:
@@ -191,66 +251,82 @@ def Upsample(in_ch, out_ch):
     )
 
 class UNet(nn.Module):
-    def __init__(self, init_ch_list=[1, 2, 3, 4], channels=3, init_out_dim=64, diff_steps=400, t_emb_size=512, init_blocks=3):
+    def __init__(self, ch_list=[1, 2, 3, 4], channels=3, in_dim=128, diff_steps=400, t_emb_size=512, init_blocks=3):
         super(UNet, self).__init__()
         
-        ## 64x64
-        self.init_conv = InceptionModule(channels, dim=init_out_dim*init_ch_list[0], stride=1)
-        self.init_block1 = ResNetBlock(init_out_dim*init_ch_list[0], t_emb_size=t_emb_size, use_ca=True)
-        self.init_block_group1 = nn.ModuleList(ResNetBlock(init_out_dim*init_ch_list[0], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
-        self.downsample1 = Downsample(init_out_dim*init_ch_list[0], init_out_dim*init_ch_list[1])
-        self.init_block_group2 = nn.ModuleList(ResNetBlock(init_out_dim*init_ch_list[1], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
-        self.downsample2 = Downsample(init_out_dim*init_ch_list[1], init_out_dim*init_ch_list[2])
-        self.init_block_group3 = nn.ModuleList(ResNetBlock(init_out_dim*init_ch_list[2], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
-        self.downsample3 = Downsample(init_out_dim*init_ch_list[2], init_out_dim*init_ch_list[3])
-        self.init_block2 = ResNetBlock(init_out_dim*init_ch_list[3], t_emb_size=t_emb_size, use_ca=True)
-        self.init_block3 = ResNetBlock(init_out_dim*init_ch_list[3], t_emb_size=t_emb_size, use_ca=True)
-        self.upsample1 = Upsample(init_out_dim*init_ch_list[3], init_out_dim*init_ch_list[2])
+        self.init_conv = InceptionModule(channels, dim=in_dim*ch_list[0], stride=1)
+        self.init_block1 = ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size, use_ca=True)
+        self.block_group1 = nn.ModuleList(ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.downsample1 = Downsample(in_dim*ch_list[0], in_dim*ch_list[1])
+        self.init_block2 = ResNetBlock(in_dim*ch_list[1], t_emb_size=t_emb_size, use_ca=True)
+        self.block_group2 = nn.ModuleList(ResNetBlock(in_dim*ch_list[1], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.downsample2 = Downsample(in_dim*ch_list[1], in_dim*ch_list[2])
+        self.init_block3 = ResNetBlock(in_dim*ch_list[2], t_emb_size=t_emb_size, use_ca=True)
+        self.block_group3 = nn.ModuleList(ResNetBlock(in_dim*ch_list[2], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.downsample3 = Downsample(in_dim*ch_list[2], in_dim*ch_list[3])
+        self.middle_block1 = ResNetBlock(in_dim*ch_list[3], t_emb_size=t_emb_size, use_ca=True)
+        self.middle_block2 = ResNetBlock(in_dim*ch_list[3], t_emb_size=t_emb_size, use_ca=True)
+        self.attention = MultiHeadAttention(in_dim*ch_list[3], context_dim=768)
+        self.upsample1 = Upsample(in_dim*ch_list[3], in_dim*ch_list[2])
+        self.init_block4 = ResNetBlock(in_dim*ch_list[2], t_emb_size=t_emb_size, use_ca=True)
+        self.block_group4 = nn.ModuleList(ResNetBlock(in_dim*ch_list[2], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.upsample2 = Upsample(in_dim*ch_list[2], in_dim*ch_list[1])
+        self.init_block5 = ResNetBlock(in_dim*ch_list[3], t_emb_size=t_emb_size, use_ca=True)
+        self.block_group5 = nn.ModuleList(ResNetBlock(in_dim*ch_list[1], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
+        self.upsample3 = Upsample(in_dim*ch_list[1], in_dim*ch_list[0])
+        self.init_block6 = ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size, use_ca=True)
+        self.block_group6 = nn.ModuleList(ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
         
-        ## upsample
-        self.t_emb  = self.get_timestep_embedding(diff_steps, t_emb_size)
-        self.db1 = DBlock(ch=128, t_emb_size=t_emb_size, n_blocks=2)
-        self.db2 = DBlock(ch=256, t_emb_size=t_emb_size, n_blocks=4)
-        self.db3 = DBlock(ch=512, t_emb_size=t_emb_size, n_blocks=8)
-        self.db4 = DBlock(ch=1024, t_emb_size=t_emb_size, n_blocks=8, downsample=False, use_ca=True)
-        self.ub1 = UBlock(ch=1024, t_emb_size=t_emb_size, n_blocks=8, se_ca=True)
-        self.ub2 = UBlock(ch=512, t_emb_size=t_emb_size, n_blocks=8)
-        self.ub3 = UBlock(ch=256, t_emb_size=t_emb_size, n_blocks=4,)
-        self.ub4 = UBlock(ch=128, t_emb_size=t_emb_size, n_blocks=2, upsample=False)
-        self.conv_out = nn.Conv2d(in_channels=128, out_channels=3, kernel_size=3)
         
     def forward(self, c_emb, x_noisy, step):
         t_emb = self.t_emb(step)
         conv1 = self.init_conv(x_noisy)
-        x = self.init_block1(t_emb, c_emb, conv1)
+        
+        x = self.init_block1(t_emb, conv1, c_emb)
         residuals = []
-        for block in self.init_block_group1:
-            x = block(t_emb, c_emb, x)
+        for block in self.block_group1:
+            x = block(t_emb, x)
             residuals.append(x)
+            
         x = self.downsample1(x)
-        for block in self.init_block_group2:
-            x = block(t_emb, c_emb, x)
+        x = self.init_block2(t_emb, x, c_emb)
+        for block in self.block_group2:
+            x = block(t_emb, x)
             residuals.append(x)
+            
         x = self.downsample2(x)
-        for block in self.init_block_group3:
-            x = block(t_emb, c_emb, x)
+        x = self.init_block3(t_emb, x, c_emb)
+        for block in self.block_group3:
+            x = block(t_emb, x)
             residuals.append(x)
+            
         x = self.downsample3(x)
-        x = self.init_block2(x)
-        x = self.init_block3(x)
+        x = self.middle_block1(t_emb, x, c_emb)
+        x = EinopsToAndFrom('b c h w', 'b (h w) c', x + self.attention(x, c_emb)) 
+        x = self.middle_block2(t_emb, x, c_emb)
         
+        add_skip_connection = lambda x: torch.cat((x, residuals.pop() * 2 ** -0.5), dim=1)
         
-        db1 = self.db1(t_emb, c_emb, x)
-        db2 = self.db2(t_emb, c_emb, db1)
-        db3 = self.db3(t_emb, c_emb, db2)
-        db4 = self.db4(t_emb, c_emb, db3)
-        ub1 = self.ub1(t_emb, c_emb, db4 + db4)
-        ub2 = self.ub2(t_emb, c_emb, ub1 + db3)
-        ub3 = self.ub3(t_emb, c_emb, ub2 + db2)
-        ub4 = self.ub4(t_emb, c_emb, ub3 + db1)
-        out = self.conv_out(ub4)
+        x = add_skip_connection(x)
+        x = self.init_block4(t_emb, x, c_emb)
+        for block in self.block_group4:
+            x = block(t_emb, add_skip_connection(x))
+        x = self.upsample1(x)
         
-        return out
+        x = add_skip_connection(x)
+        x = self.init_block5(t_emb, x, c_emb)
+        for block in self.block_group5:
+            x = block(t_emb, add_skip_connection(x))
+        x = self.upsample2(x)
+        
+        x = add_skip_connection(x)
+        x = self.init_block6(t_emb, x, c_emb)
+        for block in self.block_group6:
+            x = block(t_emb, add_skip_connection(x))
+        x = self.upsample3(x)
+        
+        return self.conv_out(x)
+        
     
     def get_timestep_embedding(timesteps, embedding_dim: int):
         """
