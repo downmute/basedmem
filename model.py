@@ -12,6 +12,16 @@ from einops import rearrange
 from einops_exts import rearrange_many, repeat_many
 from einops_exts.torch import EinopsToAndFrom
 
+
+def prob_mask_like(shape: tuple, prob: float, device: torch.device):
+    if prob == 1:
+        return torch.ones(shape, device=device, dtype=torch.bool)
+    elif prob == 0:
+        return torch.zeros(shape, device=device, dtype=torch.bool)
+    else:
+        return torch.zeros(shape, device=device).float().uniform_(0, 1) < prob
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, 
                 input_dim: int, 
@@ -250,10 +260,42 @@ def Upsample(in_ch, out_ch):
         nn.Conv2d(in_ch, out_ch, 3, padding=1)
     )
 
+def get_timestep_embedding(timesteps, embedding_dim: int):
+        """
+        From Fairseq.
+        Build sinusoidal embeddings.
+        This matches the implementation in tensor2tensor, but differs slightly
+        from the description in Section 3.5 of "Attention Is All You Need".
+        """
+        timesteps = torch.tensor(timesteps, dtype=torch.float32)
+        assert len(timesteps.shape) == 1  
+
+        half_dim = embedding_dim // 2
+        emb = torch.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+        emb = timesteps[:, None] * emb[None, :]
+        emb = torch.concat([torch.sin(emb), torch.cos(emb)], axis=1)
+        if embedding_dim % 2 == 1:  # zero pad
+            emb = torch.pad(emb, (0, 0, 0, 1))
+        assert emb.shape == [timesteps.shape[0], embedding_dim]
+        return emb
+
 class UNet(nn.Module):
-    def __init__(self, ch_list=[1, 2, 3, 4], channels=3, in_dim=128, diff_steps=400, t_emb_size=512, init_blocks=3):
+    def __init__(self, 
+        ch_list=[1, 2, 3, 4], 
+        channels=3, 
+        in_dim=128, 
+        diff_steps=400, 
+        cond_size=512, 
+        t_emb_size=512, 
+        c_emb_size=784, 
+        init_blocks=3,
+        max_text_len = 256
+    ):
         super(UNet, self).__init__()
         
+        self.t_emb_size = t_emb_size
+
         self.init_conv = InceptionModule(channels, dim=in_dim*ch_list[0], stride=1)
         self.init_block1 = ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size, use_ca=True)
         self.block_group1 = nn.ModuleList(ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
@@ -277,9 +319,24 @@ class UNet(nn.Module):
         self.init_block6 = ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size, use_ca=True)
         self.block_group6 = nn.ModuleList(ResNetBlock(in_dim*ch_list[0], t_emb_size=t_emb_size) for _ in range(init_blocks-1))
         
+        self.text_to_cond = nn.Linear(c_emb_size, cond_size)
+
+        self.to_text_no_attn_cond = nn.Sequential(
+            nn.LayerNorm(cond_size),
+            nn.Linear(cond_size, t_emb_size),
+            nn.SiLU(),
+            nn.Linear(t_emb_size, t_emb_size)
+        )
+
+        self.norm_cond = nn.LayerNorm(cond_size)
+        
+        self.max_text_len = max_text_len
+        self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_size))
+        self.null_text_hidden = nn.Parameter(torch.randn(1, t_emb_size))
         
     def forward(self, c_emb, x_noisy, step):
-        t_emb = self.t_emb(step)
+        t_emb = get_timestep_embedding(step, self.t_emb_size)
+        
         conv1 = self.init_conv(x_noisy)
         
         x = self.init_block1(t_emb, conv1, c_emb)
@@ -326,27 +383,88 @@ class UNet(nn.Module):
         x = self.upsample3(x)
         
         return self.conv_out(x)
-        
-    
-    def get_timestep_embedding(timesteps, embedding_dim: int):
-        """
-        From Fairseq.
-        Build sinusoidal embeddings.
-        This matches the implementation in tensor2tensor, but differs slightly
-        from the description in Section 3.5 of "Attention Is All You Need".
-        """
-        timesteps = torch.tensor(timesteps, dtype=torch.float32)
-        assert len(timesteps.shape) == 1  
 
-        half_dim = embedding_dim // 2
-        emb = torch.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
-        emb = timesteps[:, None] * emb[None, :]
-        emb = torch.concat([torch.sin(emb), torch.cos(emb)], axis=1)
-        if embedding_dim % 2 == 1:  # zero pad
-            emb = torch.pad(emb, (0, 0, 0, 1))
-        assert emb.shape == [timesteps.shape[0], embedding_dim]
-        return emb
+    def forward_with_cond_scale(self, *args, cond_scale: float = 1., **kwargs):
+        logits = self.forward(*args, **kwargs)
+
+        if cond_scale == 1:
+            return logits
+
+        null_logits = self.forward(*args, cond_drop_prob=1., **kwargs)
+        return null_logits + (logits - null_logits) * cond_scale
+        
+    def _text_condition(
+        self,
+        text_embeds: torch.tensor,
+        batch_size: int,
+        cond_drop_prob: float,
+        device: torch.device,
+        text_mask: torch.tensor,
+        t: torch.tensor,
+        time_tokens: torch.tensor
+    ):
+
+        # Project the text embeddings to the conditioning dimension `cond_dim`.
+        text_tokens = self.text_to_cond(text_embeds)
+
+        # Truncate the tokens to have the maximum number of allotted words.
+        text_tokens = text_tokens[:, :self.max_text_len]
+
+        # Pad the text tokens up to self.max_text_len if needed
+        text_tokens_len = text_tokens.shape[1]
+        remainder = self.max_text_len - text_tokens_len
+        if remainder > 0:
+            text_tokens = F.pad(text_tokens, (0, 0, 0, remainder))
+
+        # Prob. mask for clf-free guidance conditional dropout. Tells which elts in the batch to keep. Size (b,).
+        text_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
+
+        # Combines T5 and clf-free guidance masks
+        text_keep_mask_embed = rearrange(text_keep_mask, 'b -> b 1 1')
+        if exists(text_mask):
+            if remainder > 0:
+                text_mask = F.pad(text_mask, (0, remainder), value=False)
+
+            text_mask = rearrange(text_mask, 'b n -> b n 1')  # (b, self.max_text_len, 1)
+            text_keep_mask_embed = text_mask & text_keep_mask_embed  # (b, self.max_text_len, 1)
+
+        # Creates NULL tensor of size (1, self.max_text_len, cond_dim)
+        null_text_embed = self.null_text_embed.to(text_tokens.dtype)  # for some reason pytorch AMP not working
+
+        # Replaces masked elements with NULL
+        text_tokens = torch.where(
+            text_keep_mask_embed,
+            text_tokens,
+            null_text_embed
+        )
+
+        # Extra non-attention conditioning by projecting and then summing text embeddings to time (text hiddens)
+        # Pool the text tokens along the word dimension.
+        mean_pooled_text_tokens = text_tokens.mean(dim=-2)
+
+        # Project to `time_cond_dim`
+        text_hiddens = self.to_text_no_attn_cond(mean_pooled_text_tokens)  # (b, cond_dim) -> (b, time_cond_dim)
+
+        null_text_hidden = self.null_text_hidden.to(t.dtype)
+
+        # Drop relevant conditioning info as demanded by clf-free guidance mask
+        text_keep_mask_hidden = rearrange(text_keep_mask, 'b -> b 1')
+        text_hiddens = torch.where(
+            text_keep_mask_hidden,
+            text_hiddens,
+            null_text_hidden
+        )
+
+        # Add this conditioning to our `t` tensor
+        t = t + text_hiddens
+
+        # main conditioning tokens `c` - concatenate time/text tokens
+        c = time_tokens if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim=-2)
+
+        # normalize conditioning tokens
+        c = self.norm_cond(c)
+
+        return t, c
     
     
 class Imagen(nn.Module):
@@ -402,22 +520,10 @@ class ImagenTrainer():
             
         return torch.tensor(alphas), torch.tensor(betas)
     
-    def get_idx_from_list(vals, t, x_shape):
-        batch_size = t.shape[0]
-        out = vals.gather(-1, t.cpu())
-        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device())
-    
-    def forward_diff(self, x_0, t, device='gpu'):
-        ## returns the noise ver of img at specific timestep
-        noise = torch.randn_like(x_0)
-        sqrt_alphas_cumprod_t = self.get_idx_from_list(self.sqrt_alphas_cumprod, t, x_0.shape)
-        sqrt_one_minus_alphas_cumprod_t = self.get_idx_from_list(
-            self.sqrt_one_minus_alphas_cumprod, t, x_0.shape
-        )
-        ## return mean + variance
-        return sqrt_alphas_cumprod_t.to(device) * x_0.to(device) \
-        + sqrt_one_minus_alphas_cumprod_t.to(device) * noise.to(device), noise.to(device)
-        
+    def p_mean_variance(self, unet, x, t, noise_scheduler, text_embeds=None):
+        pred = unet.fprward
+
+   
     def load_transformed_dataset(self):
         data_transforms = [
             transforms.resize((self.img_size, self.img_size)),
